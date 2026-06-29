@@ -175,7 +175,10 @@ class CoCATrainer:
             if self.generation_config.top_p < 1.0:
                 gen_kwargs["top_p"] = self.generation_config.top_p
             with torch.no_grad():
+                # Re-enable KV cache for generation (gradient_checkpointing disables it globally).
+                _set_use_cache(self.model, True)
                 generated = self.model.generate(**encoded, **gen_kwargs)
+                _set_use_cache(self.model, False)
 
             group_partials = []
             for sequence in generated:
@@ -405,6 +408,12 @@ def _token_logprobs(model: Any, input_ids: Any, attention_mask: Any) -> Any:
     token_logprobs = torch.gather(log_probs, dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
     shifted_attention = attention_mask[:, 1:].to(token_logprobs.dtype)
     return token_logprobs * shifted_attention
+
+
+def _set_use_cache(model: Any, value: bool) -> None:
+    base = getattr(model, "base_model", model)
+    if hasattr(base, "config"):
+        base.config.use_cache = value
 
 
 def _cycle(iterable: Iterable[Any]) -> Iterable[Any]:
