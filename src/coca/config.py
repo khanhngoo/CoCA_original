@@ -30,7 +30,7 @@ class ModelConfig:
 
 @dataclass(slots=True)
 class GenerationConfig:
-    max_new_tokens: int = 512
+    max_new_tokens: int = 2048
     temperature: float = 1.0
     # Paper (App. B.1) uses no nucleus/top-k sampling during training; 1.0 disables truncation.
     top_p: float = 1.0
@@ -41,8 +41,8 @@ class GenerationConfig:
 class TrainingConfig:
     output_dir: Path = Path("outputs/coca-qwen2.5-1.5b-lora")
     max_steps: int = 1000
-    per_device_batch_size: int = 1
-    group_size: int = 8
+    per_device_batch_size: int = 2
+    group_size: int = 16
     gradient_accumulation_steps: int = 1
     learning_rate: float = 1e-6  # paper App. B.1
     weight_decay: float = 0.0
@@ -56,6 +56,7 @@ class TrainingConfig:
     save_steps: int = 100
     seed: int = 42
     invalid_confidence_reward: float = -1.0
+    use_vllm: bool = False
     wandb_project: str | None = None
     wandb_run_name: str | None = None
 
@@ -66,7 +67,7 @@ class EvalConfig:
     base_model: str = "Qwen/Qwen2.5-1.5B-Instruct"
     split: str = "train"
     limit: int = 200
-    max_new_tokens: int = 512
+    max_new_tokens: int = 2048
     temperature: float = 0.0
 
 

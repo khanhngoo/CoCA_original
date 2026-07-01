@@ -52,6 +52,25 @@ class CoCATrainer:
         self.train_config = train_config
         self.generation_config = generation_config
         self.pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id
+        self._vllm_engine: Any = None
+        if train_config.use_vllm:
+            self._init_vllm_engine()
+
+    def _init_vllm_engine(self) -> None:
+        try:
+            from vllm import LLM
+        except ImportError as exc:
+            raise RuntimeError(
+                "Install vllm to use --use-vllm: pip install vllm"
+            ) from exc
+        base = getattr(self.model, "base_model", self.model)
+        base_name = base.config.name_or_path
+        self._vllm_engine = LLM(
+            model=base_name,
+            dtype="bfloat16",
+            gpu_memory_utilization=0.4,
+            enforce_eager=False,
+        )
 
     def train(self) -> None:
         import torch
@@ -66,6 +85,11 @@ class CoCATrainer:
         output_dir = Path(self.train_config.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         self._save_configs(output_dir)
+
+        accelerator = Accelerator(
+            gradient_accumulation_steps=self.train_config.gradient_accumulation_steps,
+            mixed_precision=self.train_config.mixed_precision,
+        )
 
         use_wandb = self.train_config.wandb_project is not None
         if use_wandb and accelerator.is_local_main_process:
@@ -82,11 +106,6 @@ class CoCATrainer:
             except ImportError:
                 use_wandb = False
                 print("wandb not installed — run `pip install wandb` to enable logging.")
-
-        accelerator = Accelerator(
-            gradient_accumulation_steps=self.train_config.gradient_accumulation_steps,
-            mixed_precision=self.train_config.mixed_precision,
-        )
         dataloader = DataLoader(
             self.dataset,
             batch_size=self.train_config.per_device_batch_size,
@@ -127,6 +146,8 @@ class CoCATrainer:
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
+                if self._vllm_engine is not None and accelerator.sync_gradients:
+                    self._sync_weights_to_vllm()
 
             if accelerator.is_local_main_process and step % self.train_config.logging_steps == 0:
                 stats["loss"] = float(loss.detach().cpu())
@@ -162,23 +183,7 @@ class CoCATrainer:
             )
             encoded = {key: value.to(device) for key, value in encoded.items()}
             prompt_len = int(encoded["attention_mask"].sum().item())
-            gen_kwargs: dict[str, Any] = dict(
-                max_new_tokens=self.generation_config.max_new_tokens,
-                do_sample=self.generation_config.do_sample,
-                temperature=self.generation_config.temperature,
-                num_return_sequences=self.train_config.group_size,
-                pad_token_id=self.pad_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
-            )
-            # Paper trains without nucleus/top-k sampling to preserve the model's intrinsic
-            # output distribution; only pass top_p when it actually truncates (< 1.0).
-            if self.generation_config.top_p < 1.0:
-                gen_kwargs["top_p"] = self.generation_config.top_p
-            with torch.no_grad():
-                # Re-enable KV cache for generation (gradient_checkpointing disables it globally).
-                _set_use_cache(self.model, True)
-                generated = self.model.generate(**encoded, **gen_kwargs)
-                _set_use_cache(self.model, False)
+            generated = self._generate_completions(encoded, device)
 
             group_partials = []
             for sequence in generated:
@@ -187,6 +192,11 @@ class CoCATrainer:
                 masks = segment_completion_token_masks(self.tokenizer, completion_ids)
                 confidence, answer_score = score_completion(masks.text, example.answer)
                 group_partials.append((ids, completion_ids, masks, confidence, answer_score))
+
+            # Option A: drop rollouts missing the confidence tag (paper assumes tag compliance).
+            group_partials = [p for p in group_partials if p[2].confidence_span is not None]
+            if not group_partials:
+                continue
 
             rewards = compute_group_rewards(
                 [item[3] for item in group_partials],
@@ -225,6 +235,72 @@ class CoCATrainer:
                 )
         self.model.train()
         return all_samples
+
+    def _generate_completions(self, encoded: dict[str, Any], device: Any) -> Any:
+        import torch
+
+        if self._vllm_engine is not None:
+            return self._vllm_generate(encoded, device)
+
+        gen_kwargs: dict[str, Any] = dict(
+            max_new_tokens=self.generation_config.max_new_tokens,
+            do_sample=self.generation_config.do_sample,
+            temperature=self.generation_config.temperature,
+            num_return_sequences=self.train_config.group_size,
+            pad_token_id=self.pad_token_id,
+            eos_token_id=self.tokenizer.eos_token_id,
+        )
+        # Paper trains without nucleus/top-k sampling; only pass top_p when it truncates.
+        if self.generation_config.top_p < 1.0:
+            gen_kwargs["top_p"] = self.generation_config.top_p
+        with torch.no_grad():
+            # Re-enable KV cache for generation (gradient_checkpointing disables it globally).
+            _set_use_cache(self.model, True)
+            generated = self.model.generate(**encoded, **gen_kwargs)
+            _set_use_cache(self.model, False)
+        return generated
+
+    def _vllm_generate(self, encoded: dict[str, Any], device: Any) -> Any:
+        import torch
+        from torch.nn.utils.rnn import pad_sequence
+        from vllm import SamplingParams
+
+        prompt_ids = encoded["input_ids"][0].tolist()
+        sampling_params = SamplingParams(
+            n=self.train_config.group_size,
+            temperature=self.generation_config.temperature,
+            top_p=self.generation_config.top_p if self.generation_config.top_p < 1.0 else 1.0,
+            max_tokens=self.generation_config.max_new_tokens,
+        )
+        outputs = self._vllm_engine.generate(
+            prompt_token_ids=[prompt_ids],
+            sampling_params=sampling_params,
+        )
+        prompt_tensor = encoded["input_ids"][0].to(device)
+        sequences = []
+        for completion_output in outputs[0].outputs:
+            completion = torch.tensor(
+                list(completion_output.token_ids), dtype=torch.long, device=device
+            )
+            sequences.append(torch.cat([prompt_tensor, completion]))
+        return pad_sequence(sequences, batch_first=True, padding_value=self.pad_token_id)
+
+    def _sync_weights_to_vllm(self) -> None:
+        """Copy current HF model weights into the vLLM engine worker in-place."""
+        merged = False
+        if hasattr(self.model, "merge_adapter"):
+            self.model.merge_adapter()
+            merged = True
+        try:
+            unwrapped = getattr(self.model, "base_model", self.model)
+            executor = self._vllm_engine.llm_engine.model_executor
+            for name, param in unwrapped.named_parameters():
+                executor.collective_rpc("update_weights", args=(name, param.data.cpu()))
+        except Exception as exc:
+            print(f"[vllm] weight sync failed ({exc}); vLLM weights may be stale.")
+        finally:
+            if merged and hasattr(self.model, "unmerge_adapter"):
+                self.model.unmerge_adapter()
 
     def _frozen_logprobs(
         self, group_ids: list[list[int]], device: Any, use_reference: bool

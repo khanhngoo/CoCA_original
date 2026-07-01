@@ -20,14 +20,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default="outputs/coca-qwen2.5-1.5b-lora")
     parser.add_argument("--limit-train-samples", type=int, default=None)
     parser.add_argument("--max-steps", type=int, default=1000)
-    parser.add_argument("--per-device-batch-size", type=int, default=1)
-    parser.add_argument("--group-size", type=int, default=8)
+    parser.add_argument("--per-device-batch-size", type=int, default=2)
+    parser.add_argument("--group-size", type=int, default=16)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--learning-rate", type=float, default=1e-6)
     parser.add_argument("--warmup-steps", type=int, default=25)
     parser.add_argument("--save-steps", type=int, default=100)
     parser.add_argument("--logging-steps", type=int, default=1)
-    parser.add_argument("--max-new-tokens", type=int, default=512)
+    parser.add_argument("--max-new-tokens", type=int, default=2048)
+    parser.add_argument("--use-vllm", action="store_true", default=False)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--clip-epsilon", type=float, default=0.2)
@@ -71,6 +72,7 @@ def main() -> None:
         kl_beta=args.kl_beta,
         seed=args.seed,
         mixed_precision=mixed_precision,
+        use_vllm=args.use_vllm,
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run_name,
     )
